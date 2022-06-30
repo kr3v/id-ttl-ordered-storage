@@ -2,36 +2,27 @@ package id_ttl_ordered_storage
 
 import (
 	"errors"
-	"io"
-	"io/ioutil"
+	"fmt"
+	"log"
 	"os"
-	"path"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 )
 
-///
-
-type buffer struct {
-	buff    []byte
-	counter int
-
-	from time.Time
-	db   *DB
-	path string
-}
-
-func newBuffer(db *DB, path string, prevBuff []byte) buffer {
-	return buffer{path: path, db: db, from: time.Now(), buff: prevBuff}
-}
+var (
+	ErrPathNotFound = errors.New("")
+)
 
 ///
 
 type storedPath struct {
 	from, until time.Time
-	records     int
+	mmap        *MMap
+
+	bytes int
+	count int
 }
 
 ///
@@ -56,11 +47,9 @@ type DB struct {
 	options Options
 	mutex   sync.Mutex
 
-	buffer buffer
-
-	currentPath string
-	pathCounter int
-	paths       []storedPath
+	counter int
+	current *storedPath
+	paths   map[int]*storedPath
 }
 
 func NewDB(options Options) (*DB, error) {
@@ -70,47 +59,32 @@ func NewDB(options Options) (*DB, error) {
 	if err := os.MkdirAll(options.Path, 0o700); err != nil {
 		return nil, err
 	}
-	db := &DB{options: options}
-	db.currentPath = db.updatePath()
-	db.buffer = newBuffer(db, db.currentPath, make([]byte, 0, options.MaxBufferSize))
+	db := &DB{options: options, paths: make(map[int]*storedPath)}
+	if err := db.bufferInit(); err != nil {
+		return nil, err
+	}
+
+	//go func() {
+	//	t := time.NewTicker(options.TTL)
+	//	defer t.Stop()
+	//	for {
+	//		select {
+	//		case <-t.C:
+	//
+	//		}
+	//	}
+	//}()
+
 	return db, nil
 }
 
-///
-
-func (db *DB) Get(id ID) (val []byte, err error) {
-	return db.GetB(id, make([]byte, id.length))
-}
-
-func (db *DB) GetB(id ID, dst []byte) (val []byte, err error) {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
-
-	dst = dst[:0]
-	dst = append(dst, make([]byte, id.length)...)
-
-	p := db.path(id.pathIdx)
-	if db.pathCounter == id.pathIdx {
-		copy(dst, db.buffer.buff[id.offset:int(id.offset)+id.length])
-		return dst, nil
+func (db *DB) Close() (err1 error) {
+	for _, path := range db.paths {
+		if err := path.mmap.Disconnect(); err != nil && err1 == nil {
+			err1 = err
+		}
 	}
-	f, err := os.Open(p)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	seek, err := f.Seek(id.offset, 0)
-	if err != nil {
-		return nil, err
-	}
-	if seek != id.offset {
-		return nil, errors.New("seek != id.offset")
-	}
-	_, err = io.ReadAtLeast(f, dst, id.length)
-	if err != nil {
-		return nil, err
-	}
-	return dst, nil
+	return err1
 }
 
 ///
@@ -131,22 +105,19 @@ func (a ids) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 
-func (db *DB) GetMany(vs []ID) (vals [][]byte, err error) {
-	return db.GetManyB(vs, nil, &StringBuilderUnsafe{})
-}
-
-func (db *DB) GetManyB(vs []ID, dsts [][]byte, pathBuilder *StringBuilderUnsafe) (vals [][]byte, err error) {
+func (db *DB) GetManyMMapB(vs []ID, dsts [][]byte) (vals [][]byte, err error) {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
 	var (
-		prevID ID
-		file   *os.File
+		prev ID
+		mmap *MMap
 	)
 	defer func() {
-		if file != nil {
-			_ = file.Close()
-			file = nil
+		if mmap != nil {
+			if err := mmap.ReadingStopped(); err != nil {
+				log.Println(err)
+			}
 		}
 	}()
 
@@ -156,34 +127,22 @@ func (db *DB) GetManyB(vs []ID, dsts [][]byte, pathBuilder *StringBuilderUnsafe)
 
 	sort.Sort(ids(vs))
 	for i, id := range vs {
-		if prevID.length == 0 || prevID.pathIdx != id.pathIdx {
-			if file != nil {
-				_ = file.Close()
-			}
-			file = nil
-		}
-		prevID = id
-
-		dst := append(dsts[i][:0], make([]byte, id.length)...)
-		if db.pathCounter == id.pathIdx {
-			copy(dst, db.buffer.buff[id.offset:int(id.offset)+id.length])
-		} else {
-			if file == nil {
-				file, err = os.Open(db.pathB(id.pathIdx, pathBuilder))
-				if err != nil {
-					return nil, err
+		if prev.length == 0 || prev.pathIdx != id.pathIdx {
+			if mmap != nil {
+				if err := mmap.ReadingStopped(); err != nil {
+					return nil, fmt.Errorf("%v.ReadingStopped: %w", mmap.path, err)
 				}
 			}
-			if seek, err := file.Seek(id.offset, 0); err != nil {
-				return nil, err
-			} else if seek != id.offset {
-				return nil, errors.New("seek != id.offset")
-			}
-			_, err = io.ReadAtLeast(file, dst, id.length)
-			if err != nil {
-				return nil, err
-			}
+			mmap = nil
 		}
+		prev = id
+
+		dst := append(dsts[i][:0], make([]byte, id.length)...)
+		path, ok := db.paths[id.pathIdx]
+		if !ok {
+			return nil, ErrPathNotFound
+		}
+		copy(dst, path.mmap.ptr[id.offset:int(id.offset)+id.length])
 		dsts[i] = dst
 	}
 	return dsts, nil
@@ -195,24 +154,31 @@ func (db *DB) Put(val []byte) (ID, error) {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
-	if len(db.buffer.buff)+len(val) > db.options.MaxBufferSize {
-		if err := db.flush(); err != nil {
+	if db.current.bytes+len(val) > db.options.MaxBufferSize {
+		if err := db.bufferFlush(); err != nil {
+			return ID{}, err
+		}
+		if err := db.bufferInit(); err != nil {
 			return ID{}, err
 		}
 	}
-	offset := len(db.buffer.buff)
-	db.buffer.buff = append(db.buffer.buff, val...)
-	return ID{pathIdx: db.pathCounter, offset: int64(offset), length: len(val)}, nil
+	offset := db.current.bytes
+	offsetB := db.current.mmap.ptr[offset:]
+	copy(offsetB, val)
+	db.current.bytes += len(val)
+	db.current.count++
+	return ID{pathIdx: db.counter, offset: int64(offset), length: len(val)}, nil
 }
 
-func (db *DB) updatePath() string {
-	db.pathCounter += 1
-	return db.path(db.pathCounter)
+func (db *DB) nextPath() string {
+	db.counter += 1
+	return db.path(db.counter)
 }
 
 func (db *DB) path(idx int) string {
-	return path.Join(db.options.Path, strconv.Itoa(idx)+".seq")
+	return db.pathB(idx, new(StringBuilderUnsafe))
 }
+
 func (db *DB) pathB(idx int, b *StringBuilderUnsafe) string {
 	b.Reset()
 	b.WriteString(db.options.Path)
@@ -222,16 +188,21 @@ func (db *DB) pathB(idx int, b *StringBuilderUnsafe) string {
 	return b.String()
 }
 
-func (db *DB) flush() error {
-	if err := ioutil.WriteFile(db.buffer.path, db.buffer.buff, 0o600); err != nil {
+func (db *DB) bufferFlush() error {
+	err := db.current.mmap.Disconnect()
+	if err != nil {
 		return err
 	}
-	db.paths = append(db.paths, storedPath{
-		from:    db.buffer.from,
-		until:   time.Now(),
-		records: db.buffer.counter,
-	})
-	db.currentPath = db.updatePath()
-	db.buffer = newBuffer(db, db.currentPath, db.buffer.buff[:0])
+	return db.current.mmap.ConnectRd()
+}
+
+func (db *DB) bufferInit() error {
+	p := db.nextPath()
+	m := NewMMap(p, db.options.MaxBufferSize)
+	if err := m.ConnectRdWr(); err != nil {
+		return fmt.Errorf("m.ConnectRdWr(%s): %w", p, err)
+	}
+	db.current = &storedPath{from: time.Now(), mmap: m}
+	db.paths[db.counter] = db.current
 	return nil
 }
