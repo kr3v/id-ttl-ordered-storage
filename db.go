@@ -37,6 +37,7 @@ type ID struct {
 
 type Options struct {
 	MaxBufferSize int
+	MaxFilesCount int
 	TTL           time.Duration
 	Path          string
 }
@@ -47,7 +48,9 @@ type DB struct {
 	options Options
 	mutex   sync.Mutex
 
-	counter int
+	counterFirst int
+	counterLast  int
+
 	current *storedPath
 	paths   map[int]*storedPath
 }
@@ -64,16 +67,16 @@ func NewDB(options Options) (*DB, error) {
 		return nil, err
 	}
 
-	//go func() {
-	//	t := time.NewTicker(options.TTL)
-	//	defer t.Stop()
-	//	for {
-	//		select {
-	//		case <-t.C:
-	//
-	//		}
-	//	}
-	//}()
+	go func() {
+		t := time.NewTicker(options.TTL)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+
+			}
+		}
+	}()
 
 	return db, nil
 }
@@ -105,7 +108,7 @@ func (a ids) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 
-func (db *DB) GetManyMMapB(vs []ID, dsts [][]byte) (vals [][]byte, err error) {
+func (db *DB) GetMany(vs []ID, dsts [][]byte) (vals [][]byte, err error) {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
@@ -158,21 +161,23 @@ func (db *DB) Put(val []byte) (ID, error) {
 		if err := db.bufferFlush(); err != nil {
 			return ID{}, err
 		}
-		if err := db.bufferInit(); err != nil {
-			return ID{}, err
-		}
 	}
 	offset := db.current.bytes
 	offsetB := db.current.mmap.ptr[offset:]
 	copy(offsetB, val)
 	db.current.bytes += len(val)
 	db.current.count++
-	return ID{pathIdx: db.counter, offset: int64(offset), length: len(val)}, nil
+	return ID{pathIdx: db.counterLast, offset: int64(offset), length: len(val)}, nil
 }
 
+///
+
 func (db *DB) nextPath() string {
-	db.counter += 1
-	return db.path(db.counter)
+	if db.counterFirst == 0 {
+		db.counterFirst = 1
+	}
+	db.counterLast += 1
+	return db.path(db.counterLast)
 }
 
 func (db *DB) path(idx int) string {
@@ -193,7 +198,10 @@ func (db *DB) bufferFlush() error {
 	if err != nil {
 		return err
 	}
-	return db.current.mmap.ConnectRd()
+	if err := db.current.mmap.ConnectRd(); err != nil {
+		return err
+	}
+	return db.bufferInit()
 }
 
 func (db *DB) bufferInit() error {
@@ -203,6 +211,56 @@ func (db *DB) bufferInit() error {
 		return fmt.Errorf("m.ConnectRdWr(%s): %w", p, err)
 	}
 	db.current = &storedPath{from: time.Now(), mmap: m}
-	db.paths[db.counter] = db.current
+	db.paths[db.counterLast] = db.current
+	for len(db.paths) > db.options.MaxFilesCount {
+		_, err := db.dropFirstIf(func(path *storedPath) bool { return true })
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) backgroundIteration() error {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+
+	for {
+		ok, err := db.dropFirstIf(func(path *storedPath) bool { return path.from.Sub(time.Now()) >= db.options.TTL })
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+	}
+	return nil
+}
+
+///
+
+func (db *DB) dropFirstIf(pred func(path *storedPath) bool) (bool, error) {
+	p, ok := db.paths[db.counterFirst]
+	if !ok {
+		return false, errors.New("should not happen")
+	}
+	if !pred(p) {
+		return false, nil
+	}
+	if err := db.drop(db.counterFirst, p); err != nil {
+		return false, err
+	}
+	db.counterFirst++
+	return true, nil
+}
+
+func (db *DB) drop(k int, v *storedPath) error {
+	if err := v.mmap.Disconnect(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(v.mmap.path); err != nil {
+		return err
+	}
+	delete(db.paths, k)
 	return nil
 }

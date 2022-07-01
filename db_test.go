@@ -23,21 +23,8 @@ var (
 )
 
 func BenchmarkDB_Put(b *testing.B) {
-	now := strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "_")
-	mem, err := os.Create("./heap/pprof." + now)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer mem.Close()
-	cpu, err := os.Create("./cpu/pprof." + now)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer cpu.Close()
-	if err := pprof.StartCPUProfile(cpu); err != nil {
-		b.Fatal(err)
-	}
-	defer pprof.StopCPUProfile()
+	cpu, mem := profiling(b)
+	defer profilingDefer(b, mem, cpu)
 
 	db, err := NewDB(Options{
 		MaxBufferSize: 8 * 1024 * 1024,
@@ -68,32 +55,12 @@ func BenchmarkDB_Put(b *testing.B) {
 	}
 	b.StopTimer()
 
-	if err := pprof.WriteHeapProfile(mem); err != nil {
-		b.Fatal(err)
-	}
+	rusage()
 }
 
 func BenchmarkDB_GetManyMMapB(b *testing.B) {
-	now := strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "_")
-	mem, err := os.Create("./heap/pprof." + now)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer mem.Close()
-	cpu, err := os.Create("./cpu/pprof." + now)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer cpu.Close()
-	if err := pprof.StartCPUProfile(cpu); err != nil {
-		b.Fatal(err)
-	}
-	defer pprof.StopCPUProfile()
-	defer func() {
-		if err := pprof.WriteHeapProfile(mem); err != nil {
-			b.Fatal(err)
-		}
-	}()
+	cpu, mem := profiling(b)
+	defer profilingDefer(b, mem, cpu)
 
 	db, err := NewDB(Options{
 		MaxBufferSize: 8 * 1024 * 1024,
@@ -147,7 +114,7 @@ func BenchmarkDB_GetManyMMapB(b *testing.B) {
 	b.ReportAllocs()
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		vals, err = db.GetManyMMapB(ids2, vals)
+		vals, err = db.GetMany(ids2, vals)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -166,6 +133,37 @@ func BenchmarkDB_GetManyMMapB(b *testing.B) {
 	log.Println("countersT", countersT)
 	log.Println("countersF", countersF)
 
+	rusage()
+}
+
+func profiling(b *testing.B) (*os.File, *os.File) {
+	now := strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "_")
+	mem, err := os.Create("./heap/pprof." + now)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cpu, err := os.Create("./cpu/pprof." + now)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := pprof.StartCPUProfile(cpu); err != nil {
+		b.Fatal(err)
+	}
+	return cpu, mem
+}
+
+func profilingDefer(b *testing.B, mem *os.File, cpu *os.File) {
+	defer mem.Close()
+	defer cpu.Close()
+	defer pprof.StopCPUProfile()
+	defer func() {
+		if err := pprof.WriteHeapProfile(mem); err != nil {
+			b.Fatal(err)
+		}
+	}()
+}
+
+func rusage() {
 	var ru syscall.Rusage
 	log.Println(syscall.Getrusage(syscall.RUSAGE_SELF, &ru))
 	log.Println("Utime", ru.Utime)

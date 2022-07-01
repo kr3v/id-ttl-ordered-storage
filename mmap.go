@@ -16,14 +16,14 @@ func NewMMap(path string, length int) *MMap {
 }
 
 func (m *MMap) ConnectRd() error {
-	return m.connect(syscall.O_RDONLY, syscall.PROT_READ)
+	return m.connect(syscall.O_RDONLY, syscall.PROT_READ, syscall.MADV_DONTNEED)
 }
 
 func (m *MMap) ConnectRdWr() error {
-	return m.connect(syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC, syscall.PROT_READ|syscall.PROT_WRITE)
+	return m.connect(syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MADV_SEQUENTIAL|syscall.MADV_WILLNEED)
 }
 
-func (m *MMap) connect(mode, prot int) error {
+func (m *MMap) connect(mode, prot, madv int) error {
 	fd, err := syscall.Open(m.path, mode, 0o600)
 	if err != nil {
 		return fmt.Errorf("syscall.Open(%s): %w", m.path, err)
@@ -37,11 +37,11 @@ func (m *MMap) connect(mode, prot int) error {
 
 	ptr, err := syscall.Mmap(fd, 0, m.length, prot, syscall.MAP_SHARED)
 	if err != nil {
-		return err
+		return fmt.Errorf("syscall.Mmap(%s): %w", m.path, err)
 	}
-	if err := syscall.Madvise(ptr, syscall.MADV_DONTNEED); err != nil {
+	if err := syscall.Madvise(ptr, madv); err != nil {
 		_ = syscall.Munmap(ptr)
-		return err
+		return fmt.Errorf("syscall.Madvise(%s): %w", m.path, err)
 	}
 	m.ptr = ptr
 	return nil
