@@ -33,6 +33,10 @@ type ID struct {
 	length  int
 }
 
+func NewID(pathIdx int, offset int64, length int) ID {
+	return ID{pathIdx: pathIdx, offset: offset, length: length}
+}
+
 ///
 
 type Options struct {
@@ -263,4 +267,10 @@ func (db *DB) drop(k int, v *storedPath) error {
 	}
 	delete(db.paths, k)
 	return nil
+}
+
+///
+
+func (db *DB) IsStored(id ID) bool {
+	return db.counterFirst <= id.pathIdx && id.pathIdx <= db.counterLast
 }
